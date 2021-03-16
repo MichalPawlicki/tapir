@@ -4,7 +4,7 @@ import cats.effect.{Blocker, ContextShift, Effect, Sync}
 import cats.implicits._
 import fs2.{Chunk, Collector}
 import org.http4s
-import org.http4s.Request
+import org.http4s.{Request, Response}
 import sttp.capabilities.Streams
 import sttp.tapir.Codec.PlainCodec
 import sttp.tapir.internal.{CombineParams, Params, ParamsAsAny, RichEndpointOutput, SplitParams}
@@ -25,12 +25,12 @@ import java.io.{ByteArrayInputStream, File, InputStream}
 import java.nio.ByteBuffer
 import scala.collection.Seq
 
-private[http4s] class EndpointToHttp4sClient(clientOptions: Http4sClientOptions, blocker: Blocker) {
+private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Http4sClientOptions) {
 
   def toHttp4sRequest[I, E, O, R, F[_]: Sync: ContextShift: Effect](
       e: Endpoint[I, E, O, R],
       baseUriStr: String
-  ): I => (F[http4s.Request[F]], http4s.Response[F] => F[DecodeResult[Either[E, O]]]) = { params =>
+  ): I => F[(Request[F], Response[F] => F[DecodeResult[Either[E, O]]])] = { params =>
     val baseUri = http4s.Uri.unsafeFromString(baseUriStr)
     val baseRequest = http4s.Request[F](uri = baseUri)
     val request = setInputParams[I, F](e.input, ParamsAsAny(params), baseRequest)
@@ -39,23 +39,23 @@ private[http4s] class EndpointToHttp4sClient(clientOptions: Http4sClientOptions,
       parseHttp4sResponse(e).apply(response)
     }
 
-    (request, responseParser)
+    request.tupleRight(responseParser)
   }
 
   def toHttp4sRequestUnsafe[I, E, O, R, F[_]: Sync: ContextShift: Effect](
       e: Endpoint[I, E, O, R],
       baseUri: String
-  ): I => (F[http4s.Request[F]], http4s.Response[F] => F[Either[E, O]]) = { params =>
-    val (request, responseParser) = toHttp4sRequest[I, E, O, R, F](e, baseUri).apply(params)
+  ): I => F[(Request[F], Response[F] => F[Either[E, O]])] = { params =>
+    toHttp4sRequest[I, E, O, R, F](e, baseUri).apply(params).map { case (request, responseParser) =>
+      def unsafeResponseParser(response: http4s.Response[F]): F[Either[E, O]] =
+        responseParser(response).map {
+          case DecodeResult.Value(v)    => v
+          case DecodeResult.Error(_, e) => throw e
+          case f                        => throw new IllegalArgumentException(s"Cannot decode: $f")
+        }
 
-    def unsafeResponseParser(response: http4s.Response[F]): F[Either[E, O]] =
-      responseParser(response).map {
-        case DecodeResult.Value(v)    => v
-        case DecodeResult.Error(_, e) => throw e
-        case f                        => throw new IllegalArgumentException(s"Cannot decode: $f")
-      }
-
-    (request, unsafeResponseParser)
+      (request, unsafeResponseParser)
+    }
   }
 
   @scala.annotation.tailrec
