@@ -801,7 +801,8 @@ lazy val http4sClient: ProjectMatrix = (projectMatrix in file("client/http4s-cli
     name := "tapir-http4s-client",
     libraryDependencies ++= Seq(
       "org.http4s" %% "http4s-core" % Versions.http4s,
-      "org.http4s" %% "http4s-blaze-client" % Versions.http4s % Test
+      "org.http4s" %% "http4s-blaze-client" % Versions.http4s % Test,
+      "com.softwaremill.sttp.shared" %% "fs2" % Versions.sttpShared % Optional
     )
   )
   .jvmPlatform(scalaVersions = allScalaVersions)

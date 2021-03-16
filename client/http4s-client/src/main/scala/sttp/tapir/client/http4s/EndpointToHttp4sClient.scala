@@ -1,11 +1,13 @@
 package sttp.tapir.client.http4s
 
+import cats.Applicative
 import cats.effect.{Blocker, ContextShift, Effect, Sync}
 import cats.implicits._
 import fs2.{Chunk, Collector}
 import org.http4s
 import org.http4s.{Request, Response}
 import sttp.capabilities.Streams
+import sttp.capabilities.fs2.Fs2Streams
 import sttp.tapir.Codec.PlainCodec
 import sttp.tapir.internal.{CombineParams, Params, ParamsAsAny, RichEndpointOutput, SplitParams}
 import sttp.tapir.{
@@ -95,8 +97,7 @@ private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Ht
       case EndpointIO.Body(bodyType, codec, _) =>
         setBody(value, bodyType, codec, currentReq)
       case EndpointIO.StreamBodyWrapper(StreamBodyIO(streams, _, _, _)) =>
-        //        val req2 = setStreamingBody(streams)(value.asInstanceOf[streams.BinaryStream], req)
-        throw new IllegalArgumentException("EndpointIO.StreamBodyWrapper not supported yet")
+        setStreamingBody(streams)(value.asInstanceOf[streams.BinaryStream], currentReq)
       case EndpointIO.Header(name, codec, _) =>
         val headers = codec.encode(value).map(value => http4s.Header(name, value))
         currentReq.putHeaders(headers: _*).pure[F]
@@ -175,7 +176,17 @@ private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Ht
     newReq.withContentType(contentType).pure[F]
   }
 
-  def handleInputPair[I, F[_]: Sync: ContextShift: Effect](
+  private def setStreamingBody[S, F[_]: Applicative: Effect](
+      streams: Streams[S]
+  )(value: streams.BinaryStream, request: Request[F]): F[Request[F]] =
+    streams match {
+      case _: Fs2Streams[_] =>
+        request.withEntity(value.asInstanceOf[Fs2Streams[F]#BinaryStream]).pure[F]
+      case _ =>
+        Effect[F].raiseError(new IllegalArgumentException("Only Fs2Streams streaming is supported"))
+    }
+
+  private def handleInputPair[I, F[_]: Sync: ContextShift: Effect](
       left: EndpointInput[_],
       right: EndpointInput[_],
       params: Params,
@@ -220,6 +231,9 @@ private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Ht
     bodyIsStream(out) match {
       case Some(streams) =>
         streams match {
+          case _: Fs2Streams[_] =>
+            val body: Fs2Streams[F]#BinaryStream = response.body
+            body.asInstanceOf[Any].pure[F]
           case _ => throw new IllegalArgumentException("Streams are not supported yet")
         }
       case None =>
