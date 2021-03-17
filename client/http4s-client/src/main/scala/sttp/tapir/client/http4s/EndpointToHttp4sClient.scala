@@ -5,9 +5,10 @@ import cats.effect.{Blocker, ContextShift, Effect, Sync}
 import cats.implicits._
 import fs2.{Chunk, Collector}
 import org.http4s
-import org.http4s.{Request, Response}
+import org.http4s.{EntityBody, Request, Response}
 import sttp.capabilities.Streams
 import sttp.capabilities.fs2.Fs2Streams
+import sttp.model.Part
 import sttp.tapir.Codec.PlainCodec
 import sttp.tapir.internal.{CombineParams, Params, ParamsAsAny, RichEndpointOutput, SplitParams}
 import sttp.tapir.{
@@ -20,6 +21,7 @@ import sttp.tapir.{
   EndpointOutput,
   Mapping,
   RawBodyType,
+  RawPart,
   StreamBodyIO
 }
 
@@ -130,46 +132,27 @@ private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Ht
     // TODO can't we get rid of asInstanceOf ?
     val newReq: http4s.Request[F] = bodyType match {
       case RawBodyType.StringBody(charset) =>
-        // TODO: what about charset?
         val entityEncoder = http4s.EntityEncoder.stringEncoder[F](http4s.Charset.fromNioCharset(charset))
         req.withEntity(encoded.asInstanceOf[String])(entityEncoder)
       case RawBodyType.ByteArrayBody =>
-//        http4s.EntityEncoder.byteArrayEncoder.toEntity(encoded.asInstanceOf[Array[Byte]])
         req.withEntity(encoded.asInstanceOf[Array[Byte]])
       case RawBodyType.ByteBufferBody =>
         val entityEncoder = http4s.EntityEncoder.chunkEncoder[F].contramap(Chunk.byteBuffer)
         req.withEntity(encoded.asInstanceOf[ByteBuffer])(entityEncoder)
       case RawBodyType.InputStreamBody =>
-//        throw new IllegalArgumentException("RawBodyType.InputStreamBody not supported yet")
         val entityEncoder = http4s.EntityEncoder.inputStreamEncoder[F, InputStream](blocker)
         req.withEntity(encoded.asInstanceOf[InputStream].pure[F])(entityEncoder)
       case RawBodyType.FileBody =>
         val entityEncoder = http4s.EntityEncoder.fileEncoder[F](blocker)
         req.withEntity(encoded.asInstanceOf[File])(entityEncoder)
-      case m: RawBodyType.MultipartBody =>
-        //        val parts: Seq[PlayPart] = (encoded: Seq[RawPart]).flatMap { p =>
-        //          m.partType(p.name).map { partType =>
-        //            // name, body, content type, content length, file name
-        //            val playPart =
-        //              partToPlayPart(p.asInstanceOf[Part[Any]], partType.asInstanceOf[RawBodyType[Any]], p.contentType, p.contentLength, p.fileName)
-        //
-        //            // headers; except content type set above
-        //            p.headers
-        //              .filterNot(_.is(HeaderNames.ContentType))
-        //              .foreach { header =>
-        //                playPart.addCustomHeader(header.name, header.value)
-        //              }
-        //
-        //            playPart
-        //          }
-        //        }
-        //
-        // TODO we need a BodyWritable[Source[PlayPart, _]]
-        // But it's not part of Play Standalone
-        // See https://github.com/playframework/playframework/blob/master/transport/client/play-ws/src/main/scala/play/api/libs/ws/WSBodyWritables.scala
-        // req.withBody(Source(parts.toList))
-
-        throw new IllegalArgumentException("Multipart body aren't supported")
+      case multipartBody: RawBodyType.MultipartBody =>
+        val parts = encoded.asInstanceOf[Seq[RawPart]].flatMap { rawPart =>
+          multipartBody.partType(rawPart.name).map { partType =>
+            partToHttp4sPart(rawPart, partType.asInstanceOf[RawBodyType[Any]])
+          }
+        }
+        val multipart = http4s.multipart.Multipart[F](parts.toVector)
+        req.withEntity(multipart)
     }
 
     val contentType = http4s.headers.`Content-Type`.parse(codec.format.mediaType.toString()).right.get
@@ -207,6 +190,29 @@ private[http4s] class EndpointToHttp4sClient(blocker: Blocker, clientOptions: Ht
       req: http4s.Request[F]
   ): F[http4s.Request[F]] = {
     setInputParams(tuple.asInstanceOf[EndpointInput[Any]], ParamsAsAny(codec.encode(params.asAny.asInstanceOf[II])), req)
+  }
+
+  private def partToHttp4sPart[T, F[_]: Sync: ContextShift: Effect](p: Part[T], bodyType: RawBodyType[T]): http4s.multipart.Part[F] = {
+    val contentDispositionHeader = http4s.headers.`Content-Disposition`(p.contentDispositionHeaderValue, p.otherDispositionParams)
+    val otherHeaders = p.headers.map(h => http4s.Header(h.name, h.value))
+    val allHeaders = List(contentDispositionHeader) ++ otherHeaders
+
+    val body: EntityBody[F] = bodyType match {
+      case RawBodyType.StringBody(charset) =>
+        http4s.EntityEncoder.stringEncoder[F](http4s.Charset.fromNioCharset(charset)).toEntity(p.body.asInstanceOf[String]).body
+      case RawBodyType.ByteArrayBody =>
+        http4s.EntityEncoder.byteArrayEncoder.toEntity(p.body.asInstanceOf[Array[Byte]]).body
+      case RawBodyType.ByteBufferBody =>
+        http4s.EntityEncoder.chunkEncoder[F].contramap(Chunk.byteBuffer).toEntity(p.body.asInstanceOf[ByteBuffer]).body
+      case RawBodyType.InputStreamBody =>
+        http4s.EntityEncoder.inputStreamEncoder[F, InputStream](blocker).toEntity(p.body.asInstanceOf[InputStream].pure[F]).body
+      case RawBodyType.FileBody =>
+        http4s.EntityEncoder.fileEncoder[F](blocker).toEntity(p.body.asInstanceOf[File]).body
+      case _: RawBodyType.MultipartBody =>
+        throw new IllegalArgumentException("Nested multipart bodies are not allowed")
+    }
+
+    http4s.multipart.Part[F](http4s.Headers(allHeaders), body)
   }
 
   private def parseHttp4sResponse[I, E, O, R, F[_]: Sync: ContextShift](
